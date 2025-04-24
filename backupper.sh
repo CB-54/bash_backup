@@ -15,6 +15,19 @@ Options:
 	-s | --sql  : Enable SQL dump for all databases. Must be set correct login and password in users ~/.my.cnf file
 	-z | --sqlzip : Save SQL dump into compressed .sql.gz instead of regular .sql
 
+	-p | --psql : Enable PG SQL dump for all databases
+	--pzip : Enable compressing for PG SQL dump
+	--puser {username} : Set psql user. By default "postgres" is used
+	--ppass {password} : Set psql password for password type auth
+		Warning: /root/.pgpass file will be overrided if --ppass is used
+	--pport {port} : Set custom TCP port for PGSQL server. By default 5432 is used
+	--pauth {unix|pass} : Set authorize method for psql. By default "unix" is used
+	--pdump {raw|bin} : Set file type and method for psql dump. By default "raw" is used
+		raw - save dump in text file (like MySQL .sql files)
+			Use [psql mydb < mydb.sql] to restore raw DB file
+		bin - use PG SQL binary encoding to save into binary file with compression
+			Use [pg_restore -d mydb mydb.dump] to restore bin DB file
+
 	-l | --local : Use local-to-local backup instead remote-to-local
 	-k | --ssh-key {PATH} : Path to SSH key for remote-to-local backup
 	-p | --ssh-port {PORT} : Set SSH port for remote-to-local backup
@@ -30,7 +43,7 @@ Options:
 	--force : Do not check if another copy of this program still working	
 	--mount {MOUNT} : Set a mount point, label or device to set in on read-only after making backup.
 		Example: D:/dev/sda or D:/dev/sdb1 or M:/backup or L:backup D stands for DEVICE, M stands for MOUNTPOINT, L stands for LABEL
-	--notify : Send notification to example.ua/backuplocal.php about start/end
+	--notify : Send notification to backupmon.example.ua/backuplocal.php about start/end
 	--hostname {HOSTNAME} : Set a custom hostname for --notify and --mail. By default using current server hostname
 
 	--mail {MAIL} : Send email notification about backup
@@ -47,14 +60,9 @@ Options:
 	-d | --delete-old {NUMBER}M|D : Delete backups older than N minutes/days. Ex: -d 120M or -d 14D
 		M - minutes, D - days.
 	-q | --quota {QUOTA} : Set maximum size of destenation directory in MegaBytes OR set block device ex: /dev/sda1, /dev/sda
-		Old backups will be deleted to meet quota limits. This is may take a while to calculate real size.
-		It is better to use block device.
+		Old backups will be deleted to meet quota limits.
 	--real-calc : Calculate real size for dst directory every time
 		Instead used cached size, which is may be not accurate.
-	-F | --forecast : Forecast next backup size
-		Works in pair with -q | --quota
-	--forecast-number {N} : Set last N backups to use in forecast calculating
-		Used by default 3
 	--dry : Do not delete old backups or overquota backups
 
 	-E | --exclude {PATH} : Add exclude directory/file to rsync and tar commands
@@ -74,6 +82,9 @@ function MAILERR {
 LOG() {
 	[ "$VERBOSE" == "1" ] && echo "[$(date +"%Y-%m-%d %H:%M:%S") $$] $@"
 }
+function cmdexe {
+[[ "$LOCAL" == "0" ]] && ssh ${USER}@${IP} -i $SSH_KEY -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$1" || eval $@
+}
 function SEND_MAIL { #Args
 	[[ -z $MAIL_TO ]] && { [[ "$XVERBOSELOG" == "1" ]] && LOG "Sending mail disabled."; return 0; }
 	while [[ $# -gt 0 ]]; do
@@ -84,10 +95,10 @@ function SEND_MAIL { #Args
 	echo "$MAIL_TO" | grep ':' >/dev/null 2>&1 && {
 		for mailto in $(echo $MAIL_TO | tr ':' '\n'); do 
 			LOG "Sending to $mailto"
-			curl "http://example.ua/localmail/send.php?server=${HS}&mail=${mailto}&lang=${MAIL_LANG}$MAIL_ARG"
+			curl "http://backupmon.example.ua/localmail/send.php?server=${HS}&mail=${mailto}&lang=${MAIL_LANG}$MAIL_ARG"
 			sleep 5
 		done
-	} || { curl "http://example.ua/localmail/send.php?server=${HS}&lang=${MAIL_LANG}&mail=${MAIL_TO}$MAIL_ARG"; LOG "Sending to $MAIL_TO"; }
+	} || { curl "http://backupmon.example.ua/localmail/send.php?server=${HS}&lang=${MAIL_LANG}&mail=${MAIL_TO}$MAIL_ARG"; LOG "Sending to $MAIL_TO"; }
 }
 HS=$(hostname)
 LOCAL=0
@@ -99,13 +110,17 @@ MAIL_LANG="UA"
 SSH_PORT=22
 SSH_KEY=~/.ssh/id_rsa
 USER=root
-RSYNC_ARG="-a --exclude=/dev --exclude=/sys --exclude=/proc --exclude=/home/cagefs-skeleton/proc"
+RSYNC_ARG="-a --exclude=/tmp --exclude=/var/tmp --exclude=/mnt --exclude=/dev --exclude=/run --exclude=/sys --exclude=/home*/virtfs --exclude=/proc --exclude=/home/cagefs-skeleton --exclude=/var/cagefs --exclude=/usr/share/cagefs-skeleton* --exclude=/usr/share/cagefs --exclude=/home*/*/.cagefs/tmp"
 TAR_ARG="-c"
 TAR_FORMAT="tar"
 INC=1
 FORCE=0
 FORECAST_N=3
 XVERBOSE=0
+PUSER=postgres
+PAUTH=unix
+PDUMP=raw
+PPORT=5432
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 		--src|-S)
@@ -149,12 +164,48 @@ while [[ $# -gt 0 ]]; do
 			LOCAL=1
 			shift
 			;;
+		-p|--psql)
+			PSQL=1
+			cmdexe "which psql" >/dev/null 2>&1 || { MAILERR "PostgreSQL may not be installed: psql unknown command"; exit 1; }
+			shift
+			;;
+		--pzip)
+			PSQL_ZIP=1
+			shift
+			;;
+		--puser)
+			PUSER="$2"
+			shift
+			shift
+			;;
+		--ppass)
+			PPASS="$2"
+			shift
+			shift
+			;;
+		--pauth)
+			PAUTH="${2,,}"
+			echo "$PAUTH" | grep -E "^unix$|^pass$" >/dev/null || { MAILERR "PAUTH [$PAUTH] value is not correct. Only pass or unix is avalible"; exit 1; }
+			shift
+			shift
+			;;
+		--pdump)
+			PDUMP="${2,,}"
+			echo "$PDUMP" | grep -E "^raw$|^bin$" >/dev/null || { MAILERR "PDUMP [$PDUMP] value is not correct. Only raw or bin is avalible"; exit 1; }
+			shift
+			shift
+			;;
+		--pport)
+			PPORT="$2"
+			shift
+			shift
+			;;
 		-s|--sql)
 			SQL=1
 			shift
 			;;
 		-z|--sqlzip)
-			which gzip > /dev/null 2>&1 || { MAILERR "gzip is not installed."; exit 1; }
+			cmdexe "which gzip" > /dev/null 2>&1 || { MAILERR "gzip is not installed."; exit 1; }
 			SQL_ZIP=1
 			shift
 			;;
@@ -257,6 +308,7 @@ while [[ $# -gt 0 ]]; do
 				QUOTA_DRIVE="$2"
 				df $2 >/dev/null 2>&1 || { MAILERR "Block device $2 not found"; exit 1; }
 				QUOTA=$(df -m --output=size $2 | tail -n1 | awk '{$1=$1; print}')
+				QUOTA=$(( $QUOTA * 9 / 10))
 			}
 			shift
 			shift
@@ -302,6 +354,14 @@ while [[ $# -gt 0 ]]; do
 			;;
 	esac
 done
+if [[ "$PDUMP" == "bin" && "$LOCAL" != "1" ]]; then
+	MAILERR "Binary PDUMP avalible only on local-to-local backup type (key -l | --local"
+	exit 1
+fi
+if [[ "$PSQL_ZIP" == "1" && "$PDUMP" == "bin" ]]; then
+	ERR "Use only one: PSQL_ZIP=yes or PDUMP=bin at one time"
+	exit 1
+fi
 which rsync > /dev/null 2>&1 || { MAILERR "rsync is not installed"; exit 1; }
 [[ "$DRY" != "1" ]] && FIND_ARG+=" -exec rm -rf {} +"
 [[ -z $DIRS ]] && DIRS=0
@@ -318,7 +378,7 @@ fi
 [[ "$LOCAL" == "1" ]] && RSYNC_ARG+=" --exclude $DEST" && TAR_ARG+=" --exclude=$DEST"
 function PRINT_VARS {
 	[[ "$VERBOSE" == "1" ]] || return 0
-	local VARS=(DIRS DEST SQL REAL_Q SQL_ZIP LOCAL SSH_KEY SSH_PORT USER IP OWNER MOUNTPOINT INC ARCHIVE FULL_ISO IO DRY XVERBOSE DELETE_OLD DELETE_OLD_TYPE QUOTA EXCLUDE NOTIFY HS FORCE FORECAST FORECAST_N MAIL_TO MAIL_TYPE MAIL_LANG)
+	local VARS=(DIRS DEST SQL REAL_Q SQL_ZIP PSQL PSQL_ZIP PUSER PPORT PPASS PDUMP PAUTH LOCAL SSH_KEY SSH_PORT USER IP OWNER MOUNTPOINT INC ARCHIVE FULL_ISO IO DRY XVERBOSE DELETE_OLD DELETE_OLD_TYPE QUOTA EXCLUDE NOTIFY HS FORCE FORECAST FORECAST_N MAIL_TO MAIL_TYPE MAIL_LANG)
 	for var in "${VARS[@]}"; do
 		[[ -n ${!var} ]] && printf "\t%-20s %s\n"	"$var" "${!var}"
 	done
@@ -382,13 +442,55 @@ function CALC_DEST_SIZE {
 		return 0;
 	}
 	if [[ "$REAL_Q" == "1" ]]; then
+		LOG "Calculating real $DEST size..."
+		DEST_SIZE=$(du -sm $DEST | awk {'print $1'})
+	else
 		LOG "Trying to get cached total size from forecast file"
 		DEST_SIZE=$(cat $DEST/.total_$HASH)
 		[[ -z $DEST_SIZE ]] && { LOG "Cache size not found. Calculating real size..."; DEST_SIZE=$(du -sm $DEST | awk {'print $1'}); echo $DEST_SIZE > $DEST/.total_$HASH; }
-	else
-		LOG "Calculating real $DEST size..."
-		DEST_SIZE=$(du -sm $DEST | awk {'print $1'})
 	fi
+}
+function PSQL_DUMP {
+	LOG "Starting dumping PSQL databases"
+	if [[ "$PAUTH" == "unix" ]]; then
+		RUNUSER=$(find /*/*bin* -iname 'runuser' -executable -type f)
+		if [[ -z $RUNUSER ]]; then
+			RUNUSER=/usr/sbin/runuser
+		fi
+		cmdexe "which sudo" >/dev/null 2>&1 && PRE_SQL="sudo -u $PUSER" || PRE_SQL="$RUNUSER -u $PUSER --"
+	elif [[ "$PAUTH" == "pass" ]]; then
+		PRE_SQL=""
+		if [[ -n $PPASS ]]; then
+			LOG "Editing ~/.pgpass file..."
+			cmdexe "echo \"*:*:*:$PUSER:$PPASS\" > ~/.pgpass; chmod 600 ~/.pgpass"
+		fi
+	else
+		LOG "Auth method [$PAUTH] is unknown. Skipping PGSQL dump..."
+		return 0;
+	fi
+	cmdexe "$PRE_SQL psql -p $PPORT -U $PUSER -c ''" >/dev/null && {
+		LOG "Successful connection to PGSQL"
+	} || {
+		LOG "Failed to connect to PGSQL. Skipping PGSQL dump...";
+		return 0;
+	}
+	mkdir -p ${DEST}/${ISO}_psql
+	for db in $(cmdexe "$PRE_SQL psql -p $PPORT -U $PUSER -Atc 'SELECT datname FROM pg_database WHERE datistemplate = false;'"); do
+		if [[ "$PDUMP" == "raw" ]];then
+			if [[ "$PSQL_ZIP" == "1" ]];then
+				cmdexe "$PRE_SQL pg_dump -U $PUSER -p $PPORT $db" | gzip > ${DEST}/${ISO}_psql/${db}.sql.gz
+			else
+				cmdexe "$PRE_SQL pg_dump -U $PUSER -p $PPORT $db" > ${DEST}/${ISO}_psql/${db}.sql
+			fi
+		elif [[ "$PDUMP" == "bin" ]];then
+			$PRE_SQL pg_dump -p $PPORT -U $PUSER -Fc $db -f ${DEST}/${ISO}_psql/${db}.dump
+		else
+			LOG "Unkown PGDUMP [$PDUMP] value. Skipping PGSQL dump..."
+			return 0;
+		fi
+		LOG "Database [$db] dumped: $(du -sh ${DEST}/${ISO}_psql/${db}\.*)"
+	done
+	LOG "PGSQL dump ended"
 }
 function DELETE_OVER_QUOTA {
 	if [[ "$QUOTA" != "0" ]]; then
@@ -397,7 +499,7 @@ function DELETE_OVER_QUOTA {
 		else
 			QUOTA="${QUOTA//[^0-9]/}"
 			CALC_DEST_SIZE
-			LOG "Qouta set as ${QUOTA}M and destenation directory has ${DEST_SIZE}M size"
+			LOG "Quota set as ${QUOTA}M and destenation directory has ${DEST_SIZE}M size"
 			while [ "$DEST_SIZE" -gt "$QUOTA" ]; do
 				CALC_DEST_SIZE
 				DEL_DIR=$(ls -1 $DEST | grep -E "^[0-9]{4}-[0-9]{2}-[0-9]{2}" | head -n1)
@@ -409,16 +511,18 @@ function DELETE_OVER_QUOTA {
 				if [[ "$INC" == "0" ]]; then
 					DEL_SIZE=$(grep "$DEL_DIR$" $DEST/.forecast_$HASH | awk {'print $1'})
 					[[ -z $DEL_SIZE ]] && DEL_SIZE=$(du -sm $DEST/$DEL_DIR | awk {'print $1'})
-				else
+				elif [[ -z $QUOTA_DRIVE ]]; then
 					grep "${DEL_DIR}$" $DEST/.forecast_$HASH 1>&2 2>/dev/null && { DEL_SIZE=$(grep "${DEL_DIR}$" $DEST/.forecast_$HASH | awk {'print $1'}); } || { HEAD=$(ls -1 $DEST | grep ^20 | grep -vE "sql|tar" | head -n2 | tail -n1); DEL_SIZE=$(du -sm $DEST/$HEAD $DEST/$DEL_DIR | grep $DEL_DIR | awk {'print $1'}); }
 				fi
 				[[ "$DRY" != "1" ]] && {
 					LOG "Destanation directory ${DEST} size [${DEST_SIZE}M] greater than quota [${QUOTA}M]. Deleting $DEST/$DEL_DIR	${DEL_SIZE}MB"
-					DELETE_OLD_COUNT=$(( $DELETE_OLD_COUNT + 1 ))
-					DEST_SIZE=$(( $DEST_SIZE - $DEL_SIZE ))
-					echo $DEST_SIZE > $DEST/.total_$HASH
-					grep -v "$DEL_DIR$" $DEST/.forecast_$HASH > $DEST/.tmp_$HASH
-					cat $DEST/.tmp_$HASH > $DEST/.forecast_$HASH
+					if [[ -n $DEL_SIZE ]]; then
+						DELETE_OLD_COUNT=$(( $DELETE_OLD_COUNT + 1 ))
+						DEST_SIZE=$(( $DEST_SIZE - $DEL_SIZE ))
+						echo $DEST_SIZE > $DEST/.total_$HASH
+						grep -v "$DEL_DIR$" $DEST/.forecast_$HASH > $DEST/.tmp_$HASH
+						cat $DEST/.tmp_$HASH > $DEST/.forecast_$HASH
+					fi
 					rm -rf $DEST/$DEL_DIR && sleep 10
 				}
 			done
@@ -431,12 +535,13 @@ function DELETE_OLD_BACKUP {
 	if [ "$DELETE_OLD" != "0" ]; then
 		LOG "Removing backups older than ${DELETE_OLD} ${DELETE_OLD_TYPE}..."
 		LOG "Fixing timestamps"
-		for i in $(ls -1 $DEST | grep -E "^[0-9]{4}-[0-9]{2}-[0-9]{2}"); do
+		for i in $(ls -1 $DEST | grep -vi sql | grep -E "^[0-9]{4}-[0-9]{2}-[0-9]{2}"); do
 			UBUNTU_TS=$(echo "$(echo $i | cut -c 3-)$(date +%H%M)")
 			DEF_TS=$(echo $i | grep [0-9] -o | tr -d '\n')
-			touch -t $DEF_TS $DEST/$i || touch -t $UBUNTU_TS $DEST/$i
+			touch -d $i $DEST/$i* || touch -t $DEF_TS $DEST/$i* || touch -t $UBUNTU_TS $DEST/$i*
 		done
 		[[ "$DRY" == "1" ]] && LOG "WARNING: Dry mode enable, old backups will not be deleted"
+		LOG "Deleting next backups:"
 		find $DEST -maxdepth 1 -mindepth 1 -type d -iname '2[0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*' $FIND_ARG | sort
 		LOG "Removing old backups complete."
 	else
@@ -468,9 +573,6 @@ else
 	LOG "Remount to rw/ro disabled. Skiping..."
 fi
 }
-function cmdexe {
-[[ "$LOCAL" == "0" ]] && ssh ${USER}@${IP} -i $SSH_KEY -o PasswordAuthentication=no -o StrictHostKeyChecking=no "$1" || eval $@
-}
 LOG "=============== Starting backup ==============="
 LOG "Variables set as:"
 PRINT_VARS
@@ -478,7 +580,7 @@ PRINT_VARS
 HASH=$(echo "$DEST $ARCHIVE $FULL_ISO" | md5sum | awk {'print $1'})
 if [[ "$FORCE" != "1" ]];then
 	for PID in $(cat $DEST/.hash_$HASH 2>/dev/null); do
-		ps x | awk {'print $1'} | grep "^${PID}$" > /dev/null 2>&1 && { echo "Another copy of this program [PID: $PID] still running..."; exit 1; }
+		ps x | awk {'print $1'} | grep "^${PID}$" > /dev/null 2>&1 && { LOG "Another copy of this program [PID: $PID] still running..."; exit 1; }
 	done
 fi
 remount rw
@@ -519,7 +621,7 @@ if [ "$DIRS" != "0" ]; then
 
 #######
 	Today=$(date +%A)
-	[[ "$NOTIFY" == "1" ]] && { LOG "Send notify about start"; curl "http://example.ua/backuplocal.php?server=${HS}&day=$Today&action=begin"; }
+	[[ "$NOTIFY" == "1" ]] && { LOG "Send notify about start"; curl "http://backupmon.example.ua/backuplocal.php?server=${HS}&day=$Today&action=begin"; }
 
 	if [[ "$ARCHIVE" != "1" ]]; then
 		LOG "Starting copying data from [$FROM] to [$DEST/$ISO] via rsync..."
@@ -527,10 +629,18 @@ if [ "$DIRS" != "0" ]; then
 			LAST=$(cat $DEST/.mirror_$HASH)
 			mkdir -p $DEST/$ISO
 			LOG "Making incremental backup from [$FROM] using hard links. Mirror=$LAST"
-			rsync $RSYNC_ARG -e "ssh -o PasswordAuthentication=no -o StrictHostKeyChecking=no -i $SSH_KEY -p $SSH_PORT" --link-dest=../${LAST} $FROM $DEST/$ISO --stats > $DEST/.rsync_$HASH 2>&1
+			if [[ "$LOCAL" == "1" ]]; then
+				rsync $RSYNC_ARG --link-dest=../${LAST} $FROM $DEST/$ISO --stats > $DEST/.rsync_$HASH 2>&1
+			else
+				rsync $RSYNC_ARG -e "ssh -o PasswordAuthentication=no -o StrictHostKeyChecking=no -i $SSH_KEY -p $SSH_PORT" --link-dest=../${LAST} $FROM $DEST/$ISO --stats > $DEST/.rsync_$HASH 2>&1
+			fi
 		else
 			mkdir -p $DEST/$ISO
-			rsync $RSYNC_ARG -e "ssh -o PasswordAuthentication=no -o StrictHostKeyChecking=no -i $SSH_KEY -p $SSH_PORT" $FROM $DEST/$ISO --stats > $DEST/.rsync_$HASH 2>&1
+			if [[ "$LOCAL" == "1" ]]; then
+				rsync $RSYNC_ARG  $FROM $DEST/$ISO --stats > $DEST/.rsync_$HASH 2>&1
+			else
+				rsync $RSYNC_ARG -e "ssh -o PasswordAuthentication=no -o StrictHostKeyChecking=no -i $SSH_KEY -p $SSH_PORT" $FROM $DEST/$ISO --stats > $DEST/.rsync_$HASH 2>&1
+			fi
 		fi
 		echo "$ISO" > $DEST/.mirror_$HASH
 		touch $DEST/$ISO
@@ -567,9 +677,12 @@ if [[ "$SQL" -eq "1" ]]; then
 else
 	LOG "SQL set to 0. Skipping SQL dump..."
 fi
+if [[ "$PSQL" == "1" ]]; then
+	PSQL_DUMP
+fi
 #
 sleep 2
-[[ "$NOTIFY" == "1" ]] && { LOG "Send notify about end"; curl "http://example.ua/backuplocal.php?server=${HS}&day=$Today&action=end"; }
+[[ "$NOTIFY" == "1" ]] && { LOG "Send notify about end"; curl "http://backupmon.example.ua/backuplocal.php?server=${HS}&day=$Today&action=end"; }
 
 if [[ -n "$OWNER" ]]; then
 LOG "Setting owner for $DEST/${ISO}* to $OWNER"
